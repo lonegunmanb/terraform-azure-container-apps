@@ -24,13 +24,13 @@ resource "azurerm_resource_group" "test" {
   name     = "example-container-app-${random_id.rg_name.hex}"
 }
 
-data "curl" "public_ip" {
-  http_method = "GET"
-  uri         = "https://api.ipify.org?format=json"
+module "public_ip" {
+  source  = "lonegunmanb/public-ip/lonegunmanb"
+  version = "0.1.0"
 }
 
 locals {
-  public_ip = jsondecode(data.curl.public_ip.response).ip
+  public_ip = module.public_ip.public_ip
 }
 
 resource "azurerm_virtual_network" "vnet" {
@@ -41,29 +41,26 @@ resource "azurerm_virtual_network" "vnet" {
 }
 
 resource "azurerm_subnet" "subnet" {
-  name = "subnet1"
-  resource_group_name = azurerm_resource_group.test.name
-  virtual_network_name = azurerm_virtual_network.vnet.name
-  address_prefixes = ["10.0.0.0/23"]
-
-  service_endpoints = ["Microsoft.ContainerRegistry"]
+  address_prefixes                              = ["10.0.0.0/23"]
+  name                                          = "subnet1"
+  resource_group_name                           = azurerm_resource_group.test.name
+  virtual_network_name                          = azurerm_virtual_network.vnet.name
+  private_endpoint_network_policies_enabled     = false
+  private_link_service_network_policies_enabled = false
+  service_endpoints                             = ["Microsoft.ContainerRegistry"]
 }
 
 resource "azurerm_private_endpoint" "pep" {
   location            = azurerm_resource_group.test.location
-  name                = "privateendpoint1"
+  name                = "mype"
   resource_group_name = azurerm_resource_group.test.name
   subnet_id           = azurerm_subnet.subnet.id
 
-#  private_dns_zone_group {
-#    name                 = "container-registry-group"
-#    private_dns_zone_ids = [azurerm_private_dns_zone.pdz.id]
-#  }
   private_service_connection {
-    is_manual_connection = false
-    name                 = "countainerregistryprivatelink"
+    is_manual_connection           = false
+    name                           = "countainerregistryprivatelink"
     private_connection_resource_id = azurerm_container_registry.acr.id
-    subresource_names = ["registry"]
+    subresource_names              = ["registry"]
   }
 }
 
@@ -72,41 +69,40 @@ resource "azurerm_private_dns_zone" "pdz" {
   resource_group_name = azurerm_resource_group.test.name
 }
 
-resource "azurerm_private_dns_zone" "public"{
-  name                = "azurecr.io"
-  resource_group_name = azurerm_resource_group.test.name
-}
-
 resource "azurerm_private_dns_zone_virtual_network_link" "vnetlink_private" {
-  name                  = "vnet-private-zone-link"
+  name                  = "mydnslink"
   private_dns_zone_name = azurerm_private_dns_zone.pdz.name
   resource_group_name   = azurerm_resource_group.test.name
   virtual_network_id    = azurerm_virtual_network.vnet.id
-  registration_enabled = true
 }
 
-resource "azurerm_private_dns_zone_virtual_network_link" "vnetlink_public" {
-  name                  = "vnet-public-zone-link"
-  private_dns_zone_name = azurerm_private_dns_zone.public.name
-  resource_group_name   = azurerm_resource_group.test.name
-  virtual_network_id    = azurerm_virtual_network.vnet.id
-  registration_enabled = true
+locals {
+  acr_login_server = [
+    for c in azurerm_private_endpoint.pep.custom_dns_configs : c.ip_addresses[0]
+    if c.fqdn == "${azurerm_container_registry.acr.name}.azurecr.io"
+  ][0]
 }
 
 resource "azurerm_private_dns_a_record" "private" {
   name                = azurerm_container_registry.acr.name
+  records             = [local.acr_login_server]
   resource_group_name = azurerm_resource_group.test.name
-  ttl                 = 300
-  records             = [azurerm_private_endpoint.pep.private_service_connection[0].private_ip_address]
+  ttl                 = 3600
   zone_name           = azurerm_private_dns_zone.pdz.name
 }
 
-resource "azurerm_private_dns_cname_record" "public" {
-  name                = azurerm_container_registry.acr.name
-  record              = azurerm_private_dns_a_record.private.fqdn
+locals {
+  data_endpoint_ips = { for e in azurerm_private_endpoint.pep.custom_dns_configs : e.fqdn => e.ip_addresses[0] }
+}
+
+resource "azurerm_private_dns_a_record" "data" {
+  name = "${azurerm_container_registry.acr.name}.${var.location}.data"
+  records = [
+    local.data_endpoint_ips["${azurerm_container_registry.acr.name}.${var.location}.data.azurecr.io"]
+  ]
   resource_group_name = azurerm_resource_group.test.name
-  ttl                 = 300
-  zone_name           = azurerm_private_dns_zone.public.name
+  ttl                 = 3600
+  zone_name           = azurerm_private_dns_zone.pdz.name
 }
 
 resource "azurerm_container_registry" "acr" {
@@ -114,16 +110,28 @@ resource "azurerm_container_registry" "acr" {
   name                          = "acr${random_id.container_name.hex}"
   resource_group_name           = azurerm_resource_group.test.name
   sku                           = "Premium"
-  public_network_access_enabled = false
+  admin_enabled                 = false
+  public_network_access_enabled = true
+
+  georeplications {
+    location                = var.backup_location1
+    tags                    = {}
+    zone_redundancy_enabled = true
+  }
+  georeplications {
+    location                = var.backup_location2
+    tags                    = {}
+    zone_redundancy_enabled = true
+  }
   network_rule_set {
     default_action = "Deny"
 
     ip_rule {
-      action = "Allow"
-      ip_range = local.public_ip
+      action   = "Allow"
+      ip_range = "${local.public_ip}/32"
     }
     virtual_network {
-      action = "Allow"
+      action    = "Allow"
       subnet_id = azurerm_subnet.subnet.id
     }
   }
@@ -134,41 +142,30 @@ resource "azurerm_container_registry" "acr" {
   trust_policy {
     enabled = true
   }
-  georeplications {
-    location                = "West Europe"
-    zone_redundancy_enabled = true
-    tags                    = {}
-  }
-  georeplications {
-    location                = "North Europe"
-    zone_redundancy_enabled = true
-    tags                    = {}
-  }
-  quarantine_policy_enabled = true
 }
 
 data "azurerm_container_registry_scope_map" "push_repos" {
-  name                    = "_repositories_push"
   container_registry_name = azurerm_container_registry.acr.name
+  name                    = "_repositories_push"
   resource_group_name     = azurerm_container_registry.acr.resource_group_name
 }
 
 data "azurerm_container_registry_scope_map" "pull_repos" {
-  name                    = "_repositories_pull"
   container_registry_name = azurerm_container_registry.acr.name
+  name                    = "_repositories_pull"
   resource_group_name     = azurerm_container_registry.acr.resource_group_name
 }
 
 resource "azurerm_container_registry_token" "pushtoken" {
-  name = "pushtoken"
   container_registry_name = azurerm_container_registry.acr.name
+  name                    = "pushtoken"
   resource_group_name     = azurerm_container_registry.acr.resource_group_name
   scope_map_id            = data.azurerm_container_registry_scope_map.push_repos.id
 }
 
 resource "azurerm_container_registry_token" "pulltoken" {
-  name = "pulltoken"
   container_registry_name = azurerm_container_registry.acr.name
+  name                    = "pulltoken"
   resource_group_name     = azurerm_container_registry.acr.resource_group_name
   scope_map_id            = data.azurerm_container_registry_scope_map.pull_repos.id
 }
@@ -177,7 +174,10 @@ resource "azurerm_container_registry_token_password" "pushtokenpassword" {
   container_registry_token_id = azurerm_container_registry_token.pushtoken.id
 
   password1 {
-    expiry = "2025-03-22T17:57:36+08:00"
+    expiry = timeadd(timestamp(), "24h")
+  }
+  lifecycle {
+    ignore_changes = [password1]
   }
 }
 
@@ -185,7 +185,10 @@ resource "azurerm_container_registry_token_password" "pulltokenpassword" {
   container_registry_token_id = azurerm_container_registry_token.pulltoken.id
 
   password1 {
-    expiry = "2025-03-22T17:57:36+08:00"
+    expiry = timeadd(timestamp(), "24h")
+  }
+  lifecycle {
+    ignore_changes = [password1]
   }
 }
 
@@ -198,17 +201,13 @@ resource "docker_tag" "nginx" {
   target_image = "${azurerm_container_registry.acr.login_server}/${docker_image.nginx.name}"
 }
 
-provider "docker" {
-  alias = "acr"
-}
-
 module "container_apps" {
   source = "../.."
 
-  resource_group_name            = azurerm_resource_group.test.name
-  location                       = azurerm_resource_group.test.location
-  log_analytics_workspace_name   = "loganalytics-${random_id.rg_name.hex}"
-  container_app_environment_name = "example-env-${random_id.env_name.hex}"
+  resource_group_name                                = azurerm_resource_group.test.name
+  location                                           = azurerm_resource_group.test.location
+  log_analytics_workspace_name                       = "loganalytics-${random_id.rg_name.hex}"
+  container_app_environment_name                     = "example-env-${random_id.env_name.hex}"
   container_app_environment_infrastructure_subnet_id = azurerm_subnet.subnet.id
 
   container_apps = {
@@ -226,7 +225,15 @@ module "container_apps" {
           }
         ]
       }
-
+      ingress = {
+        allow_insecure_connections = false
+        external_enabled           = true
+        target_port                = 80
+        traffic_weight = {
+          latest_revision = true
+          percentage      = 100
+        }
+      }
       registry = [
         {
           server               = azurerm_container_registry.acr.login_server
